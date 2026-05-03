@@ -397,8 +397,7 @@ df_silver_contaazul_dre_financial_categories = (
         F.current_timestamp()               .cast("string") .alias("_loaded_at"),
     )
     .withColumn(
-        "record_id",
-        F.concat_ws("-", F.col("origem_tipo"), F.col("origem_id"), F.col("categoria_id"))
+        "record_id", F.concat_ws("-", F.col("origem_tipo"), F.col("origem_id"), F.col("categoria_id"))
     )
 )
 
@@ -490,86 +489,62 @@ df_silver_contaazul_installment_payments = (
     )
 )
 
-# conta azul - financial accounts aggregations
-df_expenses_pending_agg = (
+# total_a_pagar, total_a_receber — from pending installments
+df_agg_pending_installments = (
     df_silver_contaazul_installments
     .filter(
-        (F.col("tipo_evento")       == "DESPESA") & 
-        (F.col("parcela_status")    == "PENDENTE")
-    )
-    .groupBy("id_conta_financeira")
-    .agg(
-        F.sum("nao_pago").cast("float").alias("total_a_pagar")
-    )
-)
-
-df_expenses_paid_agg = (
-    df_silver_contaazul_installment_payments
-    .join(
-        df_silver_contaazul_installments
-        .filter(
-            (F.col("tipo_evento")       == "DESPESA") &
-            (F.col("parcela_status")    == "QUITADO")
-        )
-        .select("parcela_id", "id_conta_financeira"),
-        on="parcela_id",
-        how="inner",
-    )
-    .groupBy("id_conta_financeira")
-    .agg(
-        F.sum("baixa_valor_liquido").cast("float").alias("total_pago")
-    )
-)
-
-df_revenues_pending_agg = (
-    df_silver_contaazul_installments
-    .filter(
-        (F.col("tipo_evento")       == "RECEITA") & 
-        (F.col("parcela_status")    == "PENDENTE")
-    )
-    .groupBy("id_conta_financeira")
-    .agg(
-        F.sum("nao_pago").cast("float").alias("total_a_receber")
-    )
-)
-
-df_revenues_received_agg = (
-    df_silver_contaazul_installments
-    .filter(
-        (F.col("tipo_evento")       == "RECEITA")  & 
-        (F.col("parcela_status")    == "QUITADO")
+        F.col("parcela_status") == "PENDENTE"
     )
     .groupBy(
         "id_conta_financeira"
     )
     .agg(
-        F.sum("valor_pago").cast("float").alias("total_recebido")
+        F.sum(F.when(F.col("tipo_evento") == "RECEITA", F.col("nao_pago")).otherwise(0)).cast("float").alias("total_a_receber"),
+        F.sum(F.when(F.col("tipo_evento") == "DESPESA", F.col("nao_pago")).otherwise(0)).cast("float").alias("total_a_pagar"),
     )
 )
 
-df_financial_accounts_agg = (
-    df_expenses_pending_agg
-    .join(
-        df_expenses_paid_agg,     
-        on="id_conta_financeira", 
-        how="outer"
-    )
-    .join(
-        df_revenues_pending_agg,  
-        on="id_conta_financeira", 
-        how="outer"
-    )
-    .join(
-        df_revenues_received_agg, 
-        on="id_conta_financeira", 
-        how="outer"
+# total_pago, total_recebido — from paid installments joined with payments
+df_agg_paid_installments = (
+    df_silver_contaazul_installments
+    .filter(
+        F.col("parcela_status") == "QUITADO"
     )
     .select(
+        "parcela_id", 
+        "id_conta_financeira", 
+        "tipo_evento"
+    )
+    .join(
+        df_silver_contaazul_installment_payments
+        .groupBy(
+            "parcela_id"
+        )
+        .agg(
+            F.sum("baixa_valor_liquido").cast("float").alias("total_valor_liquido")
+        ),
+        on="parcela_id",
+        how="left",
+    )
+    .groupBy(
+        "id_conta_financeira"
+    )
+    .agg(
+        F.sum(F.when(F.col("tipo_evento") == "RECEITA", F.col("total_valor_liquido")).otherwise(0)).cast("float").alias("total_recebido"),
+        F.sum(F.when(F.col("tipo_evento") == "DESPESA", F.col("total_valor_liquido")).otherwise(0)).cast("float").alias("total_pago"),
+    )
+)
+
+# combine both aggregations
+df_financial_accounts_agg = (
+    df_agg_pending_installments
+    .join(df_agg_paid_installments, on="id_conta_financeira", how="outer")
+    .select(
         F.col("id_conta_financeira"),
-        F.coalesce(F.col("total_recebido"),     F.lit(0.0)).cast("float").alias("total_recebido"),
-        F.coalesce(F.col("total_a_receber"),    F.lit(0.0)).cast("float").alias("total_a_receber"),
-        F.coalesce(F.col("total_pago"),         F.lit(0.0)).cast("float").alias("total_pago"),
-        F.coalesce(F.col("total_a_pagar"),      F.lit(0.0)).cast("float").alias("total_a_pagar"),
+        F.coalesce(F.col("total_recebido"),  F.lit(0.0)).cast("float").alias("total_recebido"),
+        F.coalesce(F.col("total_a_receber"), F.lit(0.0)).cast("float").alias("total_a_receber"),
+        F.coalesce(F.col("total_pago"),      F.lit(0.0)).cast("float").alias("total_pago"),
+        F.coalesce(F.col("total_a_pagar"),   F.lit(0.0)).cast("float").alias("total_a_pagar"),
     )
     .withColumn(
         "saldo_atual",
@@ -581,21 +556,21 @@ df_financial_accounts_agg = (
 df_silver_contaazul_financial_accounts = (
     df_bronze_contaazul_financial_accounts
     .filter(
-        F.col("id").isNotNull() &
-        (F.col("ativo") == True)
+        F.col("id").isNotNull()
+        & (F.col("ativo") == True)
     )
     .select(
-        F.col("id")                             .cast("string") .alias("id"),
-        F.col("banco")                          .cast("string") .alias("banco"),
-        F.col("codigo_banco")                   .cast("integer").alias("codigo_banco"),
-        F.col("nome")                           .cast("string") .alias("nome"),
-        F.col("ativo")                          .cast("boolean").alias("ativo"),
-        F.col("tipo")                           .cast("string") .alias("tipo"),
-        F.col("conta_padrao")                   .cast("boolean").alias("conta_padrao"),
-        F.col("possui_config_boleto_bancario")  .cast("boolean").alias("possui_config_boleto_bancario"),
-        F.col("agencia")                        .cast("string") .alias("agencia"),
-        F.col("numero")                         .cast("string") .alias("numero"),
-        F.current_timestamp()                   .cast("string") .alias("_loaded_at"),
+        F.col("id")                            .cast("string") .alias("id"),
+        F.col("banco")                         .cast("string") .alias("banco"),
+        F.col("codigo_banco")                  .cast("integer").alias("codigo_banco"),
+        F.col("nome")                          .cast("string") .alias("nome"),
+        F.col("ativo")                         .cast("boolean").alias("ativo"),
+        F.col("tipo")                          .cast("string") .alias("tipo"),
+        F.col("conta_padrao")                  .cast("boolean").alias("conta_padrao"),
+        F.col("possui_config_boleto_bancario") .cast("boolean").alias("possui_config_boleto_bancario"),
+        F.col("agencia")                       .cast("string") .alias("agencia"),
+        F.col("numero")                        .cast("string") .alias("numero"),
+        F.current_timestamp()                  .cast("string") .alias("_loaded_at"),
     )
     .join(
         df_financial_accounts_agg,
@@ -613,11 +588,11 @@ df_silver_contaazul_financial_accounts = (
         F.col("possui_config_boleto_bancario"),
         F.col("agencia"),
         F.col("numero"),
-        F.coalesce(F.col("total_recebido"),     F.lit(0.0)).cast("float").alias("total_recebido"),
-        F.coalesce(F.col("total_a_receber"),    F.lit(0.0)).cast("float").alias("total_a_receber"),
-        F.coalesce(F.col("total_pago"),         F.lit(0.0)).cast("float").alias("total_pago"),
-        F.coalesce(F.col("total_a_pagar"),      F.lit(0.0)).cast("float").alias("total_a_pagar"),
-        F.coalesce(F.col("saldo_atual"),        F.lit(0.0)).cast("float").alias("saldo_atual"),
+        F.coalesce(F.col("total_recebido"),  F.lit(0.0)).cast("float").alias("total_recebido"),
+        F.coalesce(F.col("total_a_receber"), F.lit(0.0)).cast("float").alias("total_a_receber"),
+        F.coalesce(F.col("total_pago"),      F.lit(0.0)).cast("float").alias("total_pago"),
+        F.coalesce(F.col("total_a_pagar"),   F.lit(0.0)).cast("float").alias("total_a_pagar"),
+        F.coalesce(F.col("saldo_atual"),     F.lit(0.0)).cast("float").alias("saldo_atual"),
         F.col("_loaded_at"),
     )
     .dropDuplicates(
