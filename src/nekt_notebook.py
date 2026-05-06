@@ -47,6 +47,7 @@ df_bronze_clickup_time_entries          = extract_nekt_table("Bronze", "studio61
 df_bronze_contaazul_accounts_payable    = extract_nekt_table("Bronze", "studio61_contaazul_bronze_despesas")
 df_bronze_contaazul_accounts_receivable = extract_nekt_table("Bronze", "studio61_contaazul_bronze_receitas")
 df_bronze_contaazul_categories          = extract_nekt_table("Bronze", "studio61_contaazul_bronze_categorias")
+df_bronze_contaazul_contracts           = extract_nekt_table("Bronze", "studio61_contaazul_bronze_contratos")
 df_bronze_contaazul_dre_categories      = extract_nekt_table("Bronze", "studio61_contaazul_bronze_categorias_dre")
 df_bronze_contaazul_financial_accounts  = extract_nekt_table("Bronze", "studio61_contaazul_bronze_contas_financeiras")
 df_bronze_contaazul_installments        = extract_nekt_table("Bronze", "studio61_contaazul_bronze_parcelas")
@@ -196,45 +197,21 @@ df_silver_contaazul_categories = (
     )
 )
 
-# conta azul - receivables per customer
-df_receivables_per_customer = (
-    df_bronze_contaazul_accounts_receivable
-    .filter(
-        F.col("cliente.id").isNotNull()
-    )
-    .select(
-        F.col("cliente.id")     .alias("cliente_id"),
-        F.col("data_vencimento")
-    )
-    .groupBy(
-        "cliente_id"
-    )
-    .agg(
-        F.min("data_vencimento").alias("proximo_vencimento")
-    )
-)
-
 # conta azul - customers
 df_silver_contaazul_customers = (
-    df_bronze_contaazul_people_list
+    df_bronze_contaazul_contracts
     .filter(
-        F.col("id").isNotNull() &
-        F.array_contains(F.col("perfis"), "Cliente")
-    )
-    .join(
-        df_receivables_per_customer,
-        on  = df_bronze_contaazul_people_list["id"] == df_receivables_per_customer["cliente_id"],
-        how = "left"
+        F.col("id").isNotNull()
     )
     .select(
-        F.col("id")                                                                 .cast("string") .alias("id"),
-        F.col("id")                                                                 .cast("string") .alias("cliente_id"),
-        F.col("nome")                                                               .cast("string") .alias("cliente_nome"),
-        F.when(F.col("ativo"), "ATIVO").otherwise("INATIVO")                        .cast("string") .alias("status"),
-        F.when(F.col("ativo"), F.col("proximo_vencimento")).otherwise(F.lit(None))  .cast("string") .alias("proximo_vencimento"),
-        F.col("data_criacao")                                                       .cast("string") .alias("data_inicio"),
-        F.row_number().over(Window.orderBy("data_criacao"))                         .cast("integer").alias("numero"),
-        F.current_timestamp()                                                       .cast("string") .alias("_loaded_at"),
+        F.col("id")                  .cast("string") .alias("id"),
+        F.col("cliente.id")          .cast("string") .alias("cliente_id"),
+        F.col("cliente.nome")        .cast("string") .alias("cliente_nome"),
+        F.col("status")              .cast("string") .alias("status"),
+        F.col("proximo_vencimento")  .cast("string") .alias("proximo_vencimento"),
+        F.col("data_inicio")         .cast("string") .alias("data_inicio"),
+        F.col("numero")              .cast("integer").alias("numero"),
+        F.current_timestamp()        .cast("string") .alias("_loaded_at"),
     )
     .dropDuplicates(
         ["id"]
@@ -447,7 +424,7 @@ df_silver_contaazul_installments = (
 )
 
 # conta azul - installments payments
-df_silver_contaazul_installment_payments = (
+df_silver_contaazul_installments_payments = (
     df_bronze_contaazul_installments
     .filter(
         F.col("baixas").isNotNull() &
@@ -489,69 +466,6 @@ df_silver_contaazul_installment_payments = (
     )
 )
 
-# total_a_pagar, total_a_receber — from pending installments
-df_agg_pending_installments = (
-    df_silver_contaazul_installments
-    .filter(
-        F.col("parcela_status") == "PENDENTE"
-    )
-    .groupBy(
-        "id_conta_financeira"
-    )
-    .agg(
-        F.sum(F.when(F.col("tipo_evento") == "RECEITA", F.col("nao_pago")).otherwise(0)).cast("float").alias("total_a_receber"),
-        F.sum(F.when(F.col("tipo_evento") == "DESPESA", F.col("nao_pago")).otherwise(0)).cast("float").alias("total_a_pagar"),
-    )
-)
-
-# total_pago, total_recebido — from paid installments joined with payments
-df_agg_paid_installments = (
-    df_silver_contaazul_installments
-    .filter(
-        F.col("parcela_status") == "QUITADO"
-    )
-    .select(
-        "parcela_id", 
-        "id_conta_financeira", 
-        "tipo_evento"
-    )
-    .join(
-        df_silver_contaazul_installment_payments
-        .groupBy(
-            "parcela_id"
-        )
-        .agg(
-            F.sum("baixa_valor_liquido").cast("float").alias("total_valor_liquido")
-        ),
-        on="parcela_id",
-        how="left",
-    )
-    .groupBy(
-        "id_conta_financeira"
-    )
-    .agg(
-        F.sum(F.when(F.col("tipo_evento") == "RECEITA", F.col("total_valor_liquido")).otherwise(0)).cast("float").alias("total_recebido"),
-        F.sum(F.when(F.col("tipo_evento") == "DESPESA", F.col("total_valor_liquido")).otherwise(0)).cast("float").alias("total_pago"),
-    )
-)
-
-# combine both aggregations
-df_financial_accounts_agg = (
-    df_agg_pending_installments
-    .join(df_agg_paid_installments, on="id_conta_financeira", how="outer")
-    .select(
-        F.col("id_conta_financeira"),
-        F.coalesce(F.col("total_recebido"),  F.lit(0.0)).cast("float").alias("total_recebido"),
-        F.coalesce(F.col("total_a_receber"), F.lit(0.0)).cast("float").alias("total_a_receber"),
-        F.coalesce(F.col("total_pago"),      F.lit(0.0)).cast("float").alias("total_pago"),
-        F.coalesce(F.col("total_a_pagar"),   F.lit(0.0)).cast("float").alias("total_a_pagar"),
-    )
-    .withColumn(
-        "saldo_atual",
-        (F.col("total_recebido") - F.col("total_pago")).cast("float")
-    )
-)
-
 # conta azul - financial accounts
 df_silver_contaazul_financial_accounts = (
     df_bronze_contaazul_financial_accounts
@@ -572,35 +486,12 @@ df_silver_contaazul_financial_accounts = (
         F.col("numero")                        .cast("string") .alias("numero"),
         F.current_timestamp()                  .cast("string") .alias("_loaded_at"),
     )
-    .join(
-        df_financial_accounts_agg,
-        on=F.col("id") == F.col("id_conta_financeira"),
-        how="left",
-    )
-    .select(
-        F.col("id"),
-        F.col("banco"),
-        F.col("codigo_banco"),
-        F.col("nome"),
-        F.col("ativo"),
-        F.col("tipo"),
-        F.col("conta_padrao"),
-        F.col("possui_config_boleto_bancario"),
-        F.col("agencia"),
-        F.col("numero"),
-        F.coalesce(F.col("total_recebido"),  F.lit(0.0)).cast("float").alias("total_recebido"),
-        F.coalesce(F.col("total_a_receber"), F.lit(0.0)).cast("float").alias("total_a_receber"),
-        F.coalesce(F.col("total_pago"),      F.lit(0.0)).cast("float").alias("total_pago"),
-        F.coalesce(F.col("total_a_pagar"),   F.lit(0.0)).cast("float").alias("total_a_pagar"),
-        F.coalesce(F.col("saldo_atual"),     F.lit(0.0)).cast("float").alias("saldo_atual"),
-        F.col("_loaded_at"),
-    )
     .dropDuplicates(
         ["id"]
     )
 )
 
-# df_silver_contaazul_people
+# conta azul - people
 df_silver_contaazul_people = (
     df_bronze_contaazul_people_list
     .filter(
@@ -635,8 +526,8 @@ df_silver_contaazul_people = (
     )
 )
 
-# conta azul - sales_v2
-df_silver_contaazul_sales_v2 = (
+# conta azul - sales
+df_silver_contaazul_sales = (
     df_bronze_contaazul_sales_list.alias("sl")
     .join(
         df_bronze_contaazul_sales_details.alias("sd"),
@@ -691,6 +582,6 @@ save_nekt_table(df_silver_contaazul_dre_subitems,               "Silver", "studi
 save_nekt_table(df_silver_contaazul_dre_financial_categories,   "Silver", "studio61_contaazul_silver_dre_financial_categories", "studio61_contaazul_silver")
 save_nekt_table(df_silver_contaazul_financial_accounts,         "Silver", "studio61_contaazul_silver_financial_accounts",       "studio61_contaazul_silver")
 save_nekt_table(df_silver_contaazul_installments,               "Silver", "studio61_contaazul_silver_installments",             "studio61_contaazul_silver")
-save_nekt_table(df_silver_contaazul_installment_payments,       "Silver", "studio61_contaazul_silver_installment_payments",     "studio61_contaazul_silver")
+save_nekt_table(df_silver_contaazul_installments_payments,      "Silver", "studio61_contaazul_silver_installments_payments",    "studio61_contaazul_silver")
 save_nekt_table(df_silver_contaazul_people,                     "Silver", "studio61_contaazul_silver_people",                   "studio61_contaazul_silver")
-save_nekt_table(df_silver_contaazul_sales_v2,                   "Silver", "studio61_contaazul_silver_sales_v2",                 "studio61_contaazul_silver")
+save_nekt_table(df_silver_contaazul_sales,                      "Silver", "studio61_contaazul_silver_sales",                    "studio61_contaazul_silver")
