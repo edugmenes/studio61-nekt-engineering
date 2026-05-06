@@ -1,3 +1,4 @@
 .env
 .venv/
 .spark-warehouse/
+.src/spark-warehouse/
